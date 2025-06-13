@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
+#include <limits.h>
 
 #define DEBUG 1
 #define PROGRAM_LEN_LIMIT 400
@@ -432,52 +433,172 @@ static inline void csrrci_op(void) {
 }
 
 // Chapter 12. M Extension for Integer Multiplication and Division,
+
 static inline void mul_op(void) {
-    int64_t r = (int64_t)(int32_t)REGISTERS[rs1] * (int64_t)(int32_t)REGISTERS[rs2];
-    REGISTERS[rd] = (int32_t)r;
+    uint32_t a = (uint32_t)REGISTERS[rs1];
+    uint32_t prod = 0;
+    for (int i = 0; i < 32; ++i) {
+        if (getnbits(i, i, REGISTERS[rs2])) {
+            // add (a << i)
+            prod += (uint32_t)leftShift((int)a, i);
+        }
+    }
+    REGISTERS[rd] = (int32_t)prod;
 }
 
-// TODO: fix i64 >>
+static uint32_t MUL_LO, MUL_HI;
+// helper: 32×32→64 multiply into MUL_LO/MUL_HI
+static inline void mul64(uint32_t ua, uint32_t ub) {
+    MUL_LO = 0;
+    MUL_HI = 0;
+    for (int i = 0; i < 32; ++i) {
+        if (getnbits(i, i, ub)) {
+            uint32_t v_lo = leftShift((int)ua, i);
+            uint32_t v_hi = rightShift((int)ua, 32 - i);
+            // add v_lo into MUL_LO with carry into MUL_HI
+            uint32_t new_lo = MUL_LO + v_lo;
+            uint32_t carry  = (new_lo < MUL_LO) ? 1u : 0u;
+            MUL_LO = new_lo;
+            MUL_HI = MUL_HI + v_hi + carry;
+        }
+    }
+}
+
 static inline void mulh_op(void) {
-    int64_t r = (int64_t)(int32_t)REGISTERS[rs1] * (int64_t)(int32_t)REGISTERS[rs2];
-    REGISTERS[rd] = (int32_t)(r >> 32);
-}
+    int32_t  a = REGISTERS[rs1], b = REGISTERS[rs2];
+    bool     neg = ((a < 0) != (b < 0));
+    uint32_t ua  = (uint32_t)(a < 0 ? -a : a);
+    uint32_t ub  = (uint32_t)(b < 0 ? -b : b);
 
-static inline void mulhsu_op(void) {
-    int64_t r = (int64_t)(int32_t)REGISTERS[rs1] *
-                                  (int64_t)(uint32_t)REGISTERS[rs2];
-    REGISTERS[rd] = (int32_t)(r >> 32);
+    mul64(ua, ub);
+    uint32_t hi = MUL_HI, lo = MUL_LO;
+
+    if (neg) {
+        // low overflow
+        hi = bitwiseNot((int)hi) + (lo ? 1u : 0u);
+    }
+    REGISTERS[rd] = (int32_t)hi;
 }
 
 static inline void mulhu_op(void) {
-    uint64_t r = (uint64_t)(uint32_t)REGISTERS[rs1] * (uint64_t)(uint32_t)REGISTERS[rs2];
-    REGISTERS[rd] = (int32_t)(r >> 32);
+    uint32_t ua = (uint32_t)REGISTERS[rs1];
+    uint32_t ub = (uint32_t)REGISTERS[rs2];
+    mul64(ua, ub);
+    REGISTERS[rd] = (int32_t)MUL_HI;
 }
 
-// TODO: fix / if not supported
+static inline void mulhsu_op(void) {
+    int32_t  a   = REGISTERS[rs1];
+    uint32_t ub  = (uint32_t)REGISTERS[rs2];
+    bool     neg = (a < 0);
+    uint32_t ua  = (uint32_t)(a < 0 ? -a : a);
+
+    mul64(ua, ub);
+    uint32_t hi = MUL_HI, lo = MUL_LO;
+
+    if (neg) {
+        hi = bitwiseNot((int)hi) + (lo ? 1u : 0u);
+    }
+    REGISTERS[rd] = (int32_t)hi;
+}
+
+static inline uint32_t udiv32(uint32_t dividend, uint32_t divisor) {
+    // helper function for unsigned /
+    uint32_t quot = 0, rem = 0;
+    for (int i = 31; i >= 0; --i) {
+        // rem = (rem << 1) | dividend[i]
+        rem = ((uint32_t)leftShift((int)rem, 1))
+              | (uint32_t)getnbits(i, i, dividend);
+        if (rem >= divisor) {
+            rem -= divisor;
+            quot += POW2[i];
+        }
+    }
+    return quot;
+}
+
+static inline uint32_t urem32(uint32_t dividend, uint32_t divisor) {
+    uint32_t rem = 0;
+    for (int i = 31; i >= 0; --i) {
+        rem = ((uint32_t)leftShift((int)rem, 1))
+              | (uint32_t)getnbits(i, i, dividend);
+        if (rem >= divisor) {
+            rem -= divisor;
+        }
+    }
+    return rem;
+}
+
 static inline void div_op(void) {
-    int32_t a = (int32_t)REGISTERS[rs1];
-    int32_t b = (int32_t)REGISTERS[rs2];
-    REGISTERS[rd] = (b == 0 ? -1 : a / b);
+    // DIV: signed divide, EXCEPTIONS: div by 0 -> -1, overflow (MIN/-1) -> MIN
+    int32_t a = REGISTERS[rs1];
+    int32_t b = REGISTERS[rs2];
+
+    if (b == 0) {
+        REGISTERS[rd] = -1;
+        return;
+    }
+    if (a == INT32_MIN && b == -1) {
+        REGISTERS[rd] = a;
+        return;
+    }
+
+    bool neg = ((a < 0) != (b < 0));
+    uint32_t ua = (uint32_t)(a < 0 ? -a : a);
+    uint32_t ub = (uint32_t)(b < 0 ? -b : b);
+
+    uint32_t uq = udiv32(ua, ub);
+    int32_t q = (int32_t)uq;
+    if (neg) q = -q;
+    REGISTERS[rd] = q;
 }
 
 static inline void divu_op(void) {
-    uint32_t a = (uint32_t)REGISTERS[rs1];
-    uint32_t b = (uint32_t)REGISTERS[rs2];
-    REGISTERS[rd] = (b == 0 ? UINT32_MAX : a / b);
+    // DIVU: unsigned divide, DIVU by 0 -> all bits 1
+    uint32_t ua = (uint32_t)REGISTERS[rs1];
+    uint32_t ub = (uint32_t)REGISTERS[rs2];
+
+    uint32_t q = (ub == 0)
+                 ? 0xFFFFFFFFu
+                 : udiv32(ua, ub);
+
+    REGISTERS[rd] = (int32_t)q;
 }
 
-// TODO: fix % if not supported
 static inline void rem_op(void) {
-    int32_t a = (int32_t)REGISTERS[rs1];
-    int32_t b = (int32_t)REGISTERS[rs2];
-    REGISTERS[rd] = (b == 0 ? a : a % b);
+    // REM: signed remainder, REM by 0 -> dividend, overflow case -> 0
+    int32_t a = REGISTERS[rs1];
+    int32_t b = REGISTERS[rs2];
+
+    if (b == 0) {
+        REGISTERS[rd] = a;
+        return;
+    }
+    if (a == INT32_MIN && b == -1) {
+        REGISTERS[rd] = 0;
+        return;
+    }
+
+    bool neg = (a < 0);
+    uint32_t ua = (uint32_t)(a < 0 ? -a : a);
+    uint32_t ub = (uint32_t)(b < 0 ? -b : b);
+
+    uint32_t ur = urem32(ua, ub);
+    int32_t r = (int32_t)ur;
+    if (neg) r = -r;
+    REGISTERS[rd] = r;
 }
 
 static inline void remu_op(void) {
-    uint32_t a = (uint32_t)REGISTERS[rs1];
-    uint32_t b = (uint32_t)REGISTERS[rs2];
-    REGISTERS[rd] = (b == 0 ? a : a % b);
+    // REMU: unsigned remainder, REMU by 0 -> dividend
+    uint32_t ua = (uint32_t)REGISTERS[rs1];
+    uint32_t ub = (uint32_t)REGISTERS[rs2];
+
+    uint32_t r = (ub == 0)
+                 ? ua
+                 : urem32(ua, ub);
+
+    REGISTERS[rd] = (int32_t)r;
 }
 
 #pragma endregion
