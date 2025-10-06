@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <limits.h>
 
-#define DEBUG 0
+#define DEBUG 1
 #define PROGRAM_LEN_LIMIT 400
 // CPU STATE
 int PC; // program counter
@@ -46,40 +46,21 @@ static const uint32_t POW2[32] = {
     0x10000000u, 0x20000000u, 0x40000000u, 0x80000000u
 };
 
-static inline int int_memcpy(int* dest, int* src, size_t n) {
-    // Calculate number of complete ints to copy
-    // Note: we removed div by sizeof(int) assuming
-    // that we are moving int at a time for simplified view
-    size_t int_count = n;
-    
-    // Copy int by int
-    for (size_t i = 0; i < int_count; i++) {
-        dest[i] = src[i];
-    }
-    
-    return 0;
+
+static inline void resetBitarrayBuffer() {
+    memset(bitarrayBuffer, 0, 32 * sizeof(int));
 }
 
-static inline int resetBitarrayBuffer() {
-    // memset(bitarrayBuffer, 0, 32 * sizeof(int));
-    for (int i=0; i<32; ++i){
-        bitarrayBuffer[i] = 0;
-    }
-    return 0;
-}
-
-static inline int numToBits(int val) {
+static inline void numToBits(int val) {
     resetBitarrayBuffer();
     uint32_t u = (uint32_t)val;          /* view bits as unsigned */
 
-    for (int i=0; i<32; ++i){
-        int idx = 31-i;
-        if (u+1 > POW2[idx]) {              /* test bit i */
-            bitarrayBuffer[idx] = 1;
-            u -= POW2[idx];
+    for (int i = 31; i >= 0; --i) {
+        if (u >= POW2[i]) {              /* test bit i */
+            bitarrayBuffer[i] = 1;
+            u -= POW2[i];
         }
     }
-    return 0;
 }
 
 static inline int bitsToNum(void) {
@@ -94,71 +75,57 @@ static inline int bitsToNum(void) {
 
 static inline int leftShift(int x, int n) {
     // in bitarrayBuffer, MSB is at index 31 (it's reversed)
-    // Note: these if blocks have been re-written in more conservative 
-    // way to fit with lowering passes!
-    if (n < 1)  return x;
-    else if (n > 31) return 0;
-    else {
-        numToBits(x);
-        // below is replacement for (int i = 31; i >= n; i--) bitarrayBuffer[i] = bitarrayBuffer[i-n];
-        for (int i = n; i <= 31; i++) bitarrayBuffer[31-(i-n)] = bitarrayBuffer[31-i];
-        for (int i = 0; i < n; i++) bitarrayBuffer[i] = 0;
-        return bitsToNum();
-    }
-    
+    if (n <= 0)  return x;
+    if (n >= 32) return 0;
+
+    numToBits(x);
+    for (int i = 31; i >= n; i--) bitarrayBuffer[i] = bitarrayBuffer[i-n];
+    for (int i = 0; i < n; i++) bitarrayBuffer[i] = 0;
+    return bitsToNum();
 }
 
 static inline int rightShift(int x, int n) {  
     // this is a LOGICAL right shift
-    if (n < 1) return x; // no shift
-    else if (n > 31) return 0; // shift all bits out
-    else {
-        numToBits(x); 
+    if (n <= 0) return x; // no shift
+    if (n >= 32) return 0; // shift all bits out
 
-        for (int i = 0; i < 32; i++) {
-            if (i + n < 32) {
-                bitarrayBuffer[i] = bitarrayBuffer[i+n];
-            } else {  // shift in zeroes at the top
-                bitarrayBuffer[i] = 0;
-            }
+    numToBits(x); 
+
+    for (int i = 0; i < 32; i++) {
+        if (i + n < 32) {
+            bitarrayBuffer[i] = bitarrayBuffer[i+n];
+        } else {  // shift in zeroes at the top
+            bitarrayBuffer[i] = 0;
         }
-
-        return bitsToNum();
     }
-    
+
+    return bitsToNum();
 }
 
 static inline int rightShiftArith(int x, int n) {  
     /* arithmetic right shift (sign-fill) */
-    // Note: deoptimized the code below with more cond brances to avoid arith::select op
-    // todo: for future need to modify lowerToTPUIR to handle this better?
-    if (n < 1) return x; // no shift
-    else if (n > 31  && x < 0) {
-        return -1; // fill with MSB
-    } 
-    else if (n > 31) return 0; // shift all bits out
-    else {
-        numToBits(x); 
-        int MSB = bitarrayBuffer[31];
-        for (int i = 0; i < 32; i++) {
-            if (i + n < 32) {
-                bitarrayBuffer[i] = bitarrayBuffer[i + n];
-            } else {  // shift in zeroes at the top
-                bitarrayBuffer[i] = MSB;
-            }
-        }
-        return bitsToNum();
-    }
+    if (n <= 0) return x; // no shift
+    if (n >= 32) return (x < 0) ? -1 : 0; // shift all bits out, fill with MSB
     
+    numToBits(x); 
+    int MSB = bitarrayBuffer[31];
+    for (int i = 0; i < 32; i++) {
+        if (i + n < 32) {
+            bitarrayBuffer[i] = bitarrayBuffer[i + n];
+        } else {  // shift in zeroes at the top
+            bitarrayBuffer[i] = MSB;
+        }
+    }
+    return bitsToNum();
 }
 
 static inline int getnbits(int msb, int lsb, int bits) {
     numToBits(bits); // fills bitarrayBuffer[0..31]
 
-    int resultArray[32] = {0};
     int width = msb - lsb + 1;
-    int_memcpy(resultArray, bitarrayBuffer + lsb, width);
-    int_memcpy(bitarrayBuffer, resultArray, 32);
+    int resultArray[32] = {0};
+    memcpy(resultArray, bitarrayBuffer + lsb, width * sizeof(int));
+    memcpy(bitarrayBuffer, resultArray, 32 * sizeof(int));
 
     return bitsToNum();
 }
@@ -178,7 +145,7 @@ static inline int bitwiseAnd(int x1, int x2) {
     // Start with x2’s bits
     numToBits(x2);
     int resultBits[32];
-    int_memcpy(resultBits, bitarrayBuffer, sizeof(resultBits) / sizeof(int));
+    memcpy(resultBits, bitarrayBuffer, sizeof(resultBits));
 
     // Overlay: clear any bit where x1 has 0
     numToBits(x1);
@@ -187,7 +154,7 @@ static inline int bitwiseAnd(int x1, int x2) {
             resultBits[i] = 0;
     }
 
-    int_memcpy(bitarrayBuffer, resultBits, sizeof(resultBits) / sizeof(int));
+    memcpy(bitarrayBuffer, resultBits, sizeof(resultBits));
     return bitsToNum();
 }
 
@@ -196,7 +163,7 @@ static inline int bitwiseOr(int x1, int x2) {
     // Start with x2’s bits in the buffer
     numToBits(x2);
     int resultBits[32];
-    int_memcpy(resultBits, bitarrayBuffer, sizeof(resultBits) / sizeof(int));
+    memcpy(resultBits, bitarrayBuffer, sizeof(resultBits));
 
     // Overlay x1’s bits
     numToBits(x1);
@@ -204,7 +171,7 @@ static inline int bitwiseOr(int x1, int x2) {
         if (bitarrayBuffer[i]) resultBits[i] = 1;
     }
 
-    int_memcpy(bitarrayBuffer, resultBits, sizeof(resultBits) / sizeof(int));
+    memcpy(bitarrayBuffer, resultBits, sizeof(resultBits));
     return bitsToNum();
 }
 
@@ -213,7 +180,7 @@ static inline int bitwiseXor(int x1, int x2) {
     // Start with x2’s bits
     numToBits(x2);
     int resultBits[32];
-    int_memcpy(resultBits, bitarrayBuffer, sizeof(resultBits));
+    memcpy(resultBits, bitarrayBuffer, sizeof(resultBits));
 
     // Overlay: flip any bit where x1 has 1
     numToBits(x1);
@@ -222,7 +189,7 @@ static inline int bitwiseXor(int x1, int x2) {
             resultBits[i] = 1 - resultBits[i];
     }
 
-    int_memcpy(bitarrayBuffer, resultBits, sizeof(resultBits));
+    memcpy(bitarrayBuffer, resultBits, sizeof(resultBits));
     return bitsToNum();
 }
 
@@ -231,29 +198,27 @@ static inline int bitwiseXor(int x1, int x2) {
 #pragma region R_Type_Emulation_Functions
 
 // 2.4.2. Integer Register-Register Operations
-static inline int add_op(void)  { REGISTERS[rd] = REGISTERS[rs1] + REGISTERS[rs2]; }
-static inline int sub_op(void)  { REGISTERS[rd] = REGISTERS[rs1] - REGISTERS[rs2]; }
-static inline int and_op(void)  { REGISTERS[rd] = bitwiseAnd (REGISTERS[rs1], REGISTERS[rs2]); }
-static inline int or_op (void)  { REGISTERS[rd] = bitwiseOr  (REGISTERS[rs1], REGISTERS[rs2]); }
-static inline int xor_op(void)  { REGISTERS[rd] = bitwiseXor (REGISTERS[rs1], REGISTERS[rs2]); }
+static inline void add_op(void)  { REGISTERS[rd] = REGISTERS[rs1] + REGISTERS[rs2]; }
+static inline void sub_op(void)  { REGISTERS[rd] = REGISTERS[rs1] - REGISTERS[rs2]; }
+static inline void and_op(void)  { REGISTERS[rd] = bitwiseAnd (REGISTERS[rs1], REGISTERS[rs2]); }
+static inline void or_op (void)  { REGISTERS[rd] = bitwiseOr  (REGISTERS[rs1], REGISTERS[rs2]); }
+static inline void xor_op(void)  { REGISTERS[rd] = bitwiseXor (REGISTERS[rs1], REGISTERS[rs2]); }
 
 static inline int shamt_from_reg(int r) { return getnbits(4, 0, REGISTERS[r]); }
 
-static inline int sll_op(void)  { REGISTERS[rd] = leftShift       (REGISTERS[rs1], shamt_from_reg(rs2)); }
-static inline int srl_op(void)  { REGISTERS[rd] = rightShift      (REGISTERS[rs1], shamt_from_reg(rs2)); }
-static inline int sra_op(void)  { REGISTERS[rd] = rightShiftArith (REGISTERS[rs1], shamt_from_reg(rs2)); }
+static inline void sll_op(void)  { REGISTERS[rd] = leftShift       (REGISTERS[rs1], shamt_from_reg(rs2)); }
+static inline void srl_op(void)  { REGISTERS[rd] = rightShift      (REGISTERS[rs1], shamt_from_reg(rs2)); }
+static inline void sra_op(void)  { REGISTERS[rd] = rightShiftArith (REGISTERS[rs1], shamt_from_reg(rs2)); }
 
-static inline int slt_op(void)  {
+
+static inline void slt_op(void)  {
     REGISTERS[rd] = (REGISTERS[rs1] < REGISTERS[rs2]) ? 1 : 0;
 }
 
-static inline int sltu_op(void) {
-    // unsigned int u1 = REGISTERS[rs1];
-    // unsigned int u2 = REGISTERS[rs2];
-    // REGISTERS[rd] = (u1 < u2) ? 1 : 0;
-    // Note: below is the modified version, and the one above is the original
-    int diff = (int)((unsigned int)REGISTERS[rs1] - (unsigned int)REGISTERS[rs2]);
-    REGISTERS[rd] = (diff < 0) ? 1 : 0;
+static inline void sltu_op(void) {
+    unsigned int u1 = REGISTERS[rs1];
+    unsigned int u2 = REGISTERS[rs2];
+    REGISTERS[rd] = (u1 < u2) ? 1 : 0;
 }
 #pragma endregion
 
@@ -261,44 +226,38 @@ static inline int sltu_op(void) {
 
 // --- helper: sign-extend 12-bit immediate ---------------------------------
 static inline int sign_extend_12(int imm12) {        // 0x800 = bit11 set
-    // return (imm12 >= 0x800) ? (imm12 - 0x1000) : imm12;
-    // todo: double check this?
-    return (imm12+1 > 0x800) ? (imm12 - 0x1000) : imm12;
+    return (imm12 >= 0x800) ? (imm12 - 0x1000) : imm12;
 }
 
 // 2.4.1. Integer Register-Immediate Instructions
-static inline int addi_op(void) {
+static inline void addi_op(void) {
     REGISTERS[rd] = REGISTERS[rs1] + sign_extend_12(imm);
 }
 
-static inline int slti_op(void) {       // signed compare
+static inline void slti_op(void) {       // signed compare
     int simm = sign_extend_12(imm);
     REGISTERS[rd] = (REGISTERS[rs1] < simm) ? 1 : 0;
 }
 
-static inline int sltiu_op(void) {      // unsigned compare
+static inline void sltiu_op(void) {      // unsigned compare
     unsigned int u1 = REGISTERS[rs1];
-    unsigned int uimm = (unsigned) sign_extend_12(imm);
-    // REGISTERS[rd] = (u1 < uimm) ? 1 : 0;
-
-    int diff = (int)(u1 - uimm);
-    REGISTERS[rd] = (diff < 0) ? 1 : 0;
-
+    unsigned int uimm = (unsigned)sign_extend_12(imm);
+    REGISTERS[rd] = (u1 < uimm) ? 1 : 0;
 }
 
-static inline int ori_op(void)  { REGISTERS[rd] = bitwiseOr (REGISTERS[rs1], sign_extend_12(imm)); }
-static inline int andi_op(void) { REGISTERS[rd] = bitwiseAnd(REGISTERS[rs1], sign_extend_12(imm)); }
-static inline int xori_op(void) { REGISTERS[rd] = bitwiseXor(REGISTERS[rs1], sign_extend_12(imm)); }
+static inline void ori_op(void)  { REGISTERS[rd] = bitwiseOr (REGISTERS[rs1], sign_extend_12(imm)); }
+static inline void andi_op(void) { REGISTERS[rd] = bitwiseAnd(REGISTERS[rs1], sign_extend_12(imm)); }
+static inline void xori_op(void) { REGISTERS[rd] = bitwiseXor(REGISTERS[rs1], sign_extend_12(imm)); }
 
 // --- Shift-immediate ops : shamt = imm[4:0] (zero-extended) ---------------
 static inline int shamt5(void) { return getnbits(4, 0, imm); }
 
-static inline int slli_op(void) { REGISTERS[rd] = leftShift        (REGISTERS[rs1], shamt5()); }
-static inline int srli_op(void) { REGISTERS[rd] = rightShift       (REGISTERS[rs1], shamt5()); }
-static inline int srai_op(void) { REGISTERS[rd] = rightShiftArith  (REGISTERS[rs1], shamt5()); }
+static inline void slli_op(void) { REGISTERS[rd] = leftShift        (REGISTERS[rs1], shamt5()); }
+static inline void srli_op(void) { REGISTERS[rd] = rightShift       (REGISTERS[rs1], shamt5()); }
+static inline void srai_op(void) { REGISTERS[rd] = rightShiftArith  (REGISTERS[rs1], shamt5()); }
 
 // 2.5.1. Unconditional Jumps
-static inline int jalr_op(void) {
+static inline void jalr_op(void) {
     int simm   = sign_extend_12(imm);
     int target = REGISTERS[rs1] + simm;
 
@@ -334,66 +293,66 @@ static inline int load_word(int addr) {
           + leftShift(b3, 24);
 }
 
-static inline int lb_op(void) {
+static inline void lb_op(void) {
     /* Load Byte (signed) */
     int addr = REGISTERS[rs1] + sign_extend_12(imm);
     int byte = dMEM[addr];
-    REGISTERS[rd] = (byte + 1 > 0x80) ? (byte - 0x100) : byte;   /* sign-extend 8→32 */
+    REGISTERS[rd] = (byte >= 0x80) ? (byte - 0x100) : byte;   /* sign-extend 8→32 */
 }
 
-static inline int lh_op(void) {
+static inline void lh_op(void) {
     /* Load Half (signed) */
     int addr = REGISTERS[rs1] + sign_extend_12(imm);
     int half = load_half(addr);
-    REGISTERS[rd] = (half + 1 > 0x8000) ? (half - 0x10000) : half; /* sign-extend 16→32 */
+    REGISTERS[rd] = (half >= 0x8000) ? (half - 0x10000) : half; /* sign-extend 16→32 */
 }
 
-static inline int lw_op(void) {
+static inline void lw_op(void) {
     /* Load Word */
     int addr = REGISTERS[rs1] + sign_extend_12(imm);
     REGISTERS[rd] = load_word(addr);
 }
 
-static inline int lbu_op(void) {
+static inline void lbu_op(void) {
     int addr = REGISTERS[rs1] + sign_extend_12(imm);
     REGISTERS[rd] = dMEM[addr];
 }
 
-static inline int lhu_op(void) {
+static inline void lhu_op(void) {
     int addr = REGISTERS[rs1] + sign_extend_12(imm);
     REGISTERS[rd] = load_half(addr);
 }
 
 // 2.7. Memory Ordering Instructions
-static inline int fence_op(int fm, int pred, int succ)
+static inline void fence_op(int fm, int pred, int succ)
 {
     /* currently as nop */
 }
 
-static inline int fence_tso_op(void)   { /* nop */ }
-static inline int pause_op(void)       { /* nop */ }
+static inline void fence_tso_op(void)   { /* nop */ }
+static inline void pause_op(void)       { /* nop */ }
 
 // 2.8. Environment Call and Breakpoints
-static inline int ecall_op(void) {
+static inline void ecall_op(void) {
     if (DEBUG) printf("ECALL at PC=%u → exiting\n", (unsigned)PC);
     skip_pc_increment = true;
     PC = PROGRAM_LEN_LIMIT;          /* forces main loop to exit */
 }
 
-static inline int ebreak_op(void) {
+static inline void ebreak_op(void) {
     if (DEBUG) printf("EBREAK at PC=%u → exiting\n", (unsigned)PC);
     skip_pc_increment = true;
     PC = PROGRAM_LEN_LIMIT;
 }
 
 // Chapter 5. "Zifencei" Extension for Instruction-Fetch Fence,
-static inline int fence_i_op(void) {
+static inline void fence_i_op(void) {
     /* Zifencei: instruction-fetch barrier (no-op in single-core ISS) */
 }
 
 // Chapter 6. "Zicsr", Extension for Control and Status Register (CSR) Instructions,
 
-static inline int csrrw_op(void) {
+static inline void csrrw_op(void) {
     // CSRRW: Atomic Read/Write CSR
     //   if rd != x0: rd = CSR; CSR = rs1
     //   if rd == x0: skip the read (no side-effects), still write CSR = rs1
@@ -406,7 +365,7 @@ static inline int csrrw_op(void) {
     CSR[csr_index] = tmp;        // write always happens
 }
 
-static inline int csrrs_op(void) {
+static inline void csrrs_op(void) {
     // CSRRS: Atomic Read and Set Bits in CSR
     //   always read→rd, then if rs1 != x0, CSR |= rs1
     int csr_index = imm; // getnbits(31, 20, instruction);
@@ -420,7 +379,7 @@ static inline int csrrs_op(void) {
     }
 }
 
-static inline int csrrc_op(void) {
+static inline void csrrc_op(void) {
     // CSRRC: Atomic Read and Clear Bits in CSR
     //   always read→rd, then if rs1 != x0, CSR &= ~rs1
     int csr_index = imm; // getnbits(31, 20, instruction);
@@ -434,7 +393,7 @@ static inline int csrrc_op(void) {
     }
 }
 
-static inline int csrrwi_op(void) {
+static inline void csrrwi_op(void) {
     // CSRRWI: Atomic Read/Write Immediate
     //   if rd != x0: rd = CSR; CSR = uimm
     //   if rd == x0: skip read, still write
@@ -448,7 +407,7 @@ static inline int csrrwi_op(void) {
     CSR[csr_index] = tmp;
 }
 
-static inline int csrrsi_op(void) {
+static inline void csrrsi_op(void) {
     // CSRRSI: Atomic Read and Set Immediate
     //   always read→rd, then if uimm != 0, CSR |= uimm
     int csr_index = imm; // getnbits(31, 20, instruction);
@@ -461,7 +420,7 @@ static inline int csrrsi_op(void) {
     }
 }
 
-static inline int csrrci_op(void) {
+static inline void csrrci_op(void) {
     // CSRRCI: Atomic Read and Clear Immediate
     //   always read→rd, then if uimm != 0, CSR &= ~uimm
     int csr_index = imm; // getnbits(31, 20, instruction);
@@ -475,7 +434,7 @@ static inline int csrrci_op(void) {
 
 // Chapter 12. M Extension for Integer Multiplication and Division,
 
-static inline int mul_op(void) {
+static inline void mul_op(void) {
     uint32_t a = (uint32_t)REGISTERS[rs1];
     uint32_t prod = 0;
     for (int i = 0; i < 32; ++i) {
@@ -489,7 +448,7 @@ static inline int mul_op(void) {
 
 static uint32_t MUL_LO, MUL_HI;
 // helper: 32×32→64 multiply into MUL_LO/MUL_HI
-static inline int mul64(uint32_t ua, uint32_t ub) {
+static inline void mul64(uint32_t ua, uint32_t ub) {
     MUL_LO = 0;
     MUL_HI = 0;
     for (int i = 0; i < 32; ++i) {
@@ -505,7 +464,7 @@ static inline int mul64(uint32_t ua, uint32_t ub) {
     }
 }
 
-static inline int mulh_op(void) {
+static inline void mulh_op(void) {
     int32_t  a = REGISTERS[rs1], b = REGISTERS[rs2];
     bool     neg = ((a < 0) != (b < 0));
     uint32_t ua  = (uint32_t)(a < 0 ? -a : a);
@@ -514,29 +473,21 @@ static inline int mulh_op(void) {
     mul64(ua, ub);
     uint32_t hi = MUL_HI, lo = MUL_LO;
 
-    bool flag = (lo != 0);
-
     if (neg) {
         // low overflow
-        // hi = bitwiseNot((int)hi) + (lo ? 1u : 0u);
-        if (flag){
-            hi = bitwiseNot((int)hi) + 1u;
-        } else {
-            hi = bitwiseNot((int)hi);
-        }
-        
-    } 
+        hi = bitwiseNot((int)hi) + (lo ? 1u : 0u);
+    }
     REGISTERS[rd] = (int32_t)hi;
 }
 
-static inline int mulhu_op(void) {
+static inline void mulhu_op(void) {
     uint32_t ua = (uint32_t)REGISTERS[rs1];
     uint32_t ub = (uint32_t)REGISTERS[rs2];
     mul64(ua, ub);
     REGISTERS[rd] = (int32_t)MUL_HI;
 }
 
-static inline int mulhsu_op(void) {
+static inline void mulhsu_op(void) {
     int32_t  a   = REGISTERS[rs1];
     uint32_t ub  = (uint32_t)REGISTERS[rs2];
     bool     neg = (a < 0);
@@ -545,15 +496,8 @@ static inline int mulhsu_op(void) {
     mul64(ua, ub);
     uint32_t hi = MUL_HI, lo = MUL_LO;
 
-    bool flag = (lo != 0);
-
     if (neg) {
-        if (flag) {
-            hi = bitwiseNot((int)hi) + 1u;
-        } else {
-            hi = bitwiseNot((int)hi);
-        }
-        
+        hi = bitwiseNot((int)hi) + (lo ? 1u : 0u);
     }
     REGISTERS[rd] = (int32_t)hi;
 }
@@ -561,22 +505,13 @@ static inline int mulhsu_op(void) {
 static inline uint32_t udiv32(uint32_t dividend, uint32_t divisor) {
     // helper function for unsigned /
     uint32_t quot = 0, rem = 0;
-    uint32_t rem1 = 0, rem2 = 0;
-    uint32_t tmp_var = 0;
-    for (int i = 0; i < 32; i++){
-        int idx = 31 - i;
+    for (int i = 31; i >= 0; --i) {
         // rem = (rem << 1) | dividend[i]
-        rem1 = (uint32_t)leftShift((int)rem, 1);
-        rem2 = (uint32_t)getnbits(idx, idx, dividend);
-        tmp_var = rem1 + rem2;
-        uint32_t tmp_var2 = rem1 -rem2;
-        // rem = rem2 | 0xFFFF0000u;
-        // rem = rem1 & rem2;
-        if (tmp_var2 | rem2 > divisor) {
+        rem = ((uint32_t)leftShift((int)rem, 1))
+              | (uint32_t)getnbits(i, i, dividend);
+        if (rem >= divisor) {
             rem -= divisor;
-            quot += POW2[idx];
-        } else{
-            rem = dividend + rem;
+            quot += POW2[i];
         }
     }
     return quot;
@@ -594,37 +529,35 @@ static inline uint32_t urem32(uint32_t dividend, uint32_t divisor) {
     return rem;
 }
 
-static inline int div_op(void) {
+static inline void div_op(void) {
     // DIV: signed divide, EXCEPTIONS: div by 0 -> -1, overflow (MIN/-1) -> MIN
     int32_t a = REGISTERS[rs1];
     int32_t b = REGISTERS[rs2];
 
     if (b == 0) {
         REGISTERS[rd] = -1;
-        return 0;
+        return;
     }
-    else if (a == INT32_MIN && b == -1) {
+    if (a == INT32_MIN && b == -1) {
         REGISTERS[rd] = a;
-        return 0;
-    } else {
-        bool neg = ((a < 0) != (b < 0));
-        uint32_t ua = (uint32_t)(a < 0 ? -a : a);
-        uint32_t ub = (uint32_t)(b < 0 ? -b : b);
-        
-        uint32_t uq = udiv32(ua, ub);
-        // int32_t q = (int32_t)uq;
-        // if (neg) q = -q;
-        // REGISTERS[rd] = q;
-
-        REGISTERS[rd] = a+1;
+        return;
     }
+
+    bool neg = ((a < 0) != (b < 0));
+    uint32_t ua = (uint32_t)(a < 0 ? -a : a);
+    uint32_t ub = (uint32_t)(b < 0 ? -b : b);
+
+    uint32_t uq = udiv32(ua, ub);
+    int32_t q = (int32_t)uq;
+    if (neg) q = -q;
+    REGISTERS[rd] = q;
 }
 
-static inline int divu_op(void) {
+static inline void divu_op(void) {
     // DIVU: unsigned divide, DIVU by 0 -> all bits 1
     uint32_t ua = (uint32_t)REGISTERS[rs1];
     uint32_t ub = (uint32_t)REGISTERS[rs2];
-    
+
     uint32_t q = (ub == 0)
                  ? 0xFFFFFFFFu
                  : udiv32(ua, ub);
@@ -632,18 +565,18 @@ static inline int divu_op(void) {
     REGISTERS[rd] = (int32_t)q;
 }
 
-static inline int rem_op(void) {
+static inline void rem_op(void) {
     // REM: signed remainder, REM by 0 -> dividend, overflow case -> 0
     int32_t a = REGISTERS[rs1];
     int32_t b = REGISTERS[rs2];
 
     if (b == 0) {
         REGISTERS[rd] = a;
-        return 0;
+        return;
     }
     if (a == INT32_MIN && b == -1) {
         REGISTERS[rd] = 0;
-        return 0;
+        return;
     }
 
     bool neg = (a < 0);
@@ -656,7 +589,7 @@ static inline int rem_op(void) {
     REGISTERS[rd] = r;
 }
 
-static inline int remu_op(void) {
+static inline void remu_op(void) {
     // REMU: unsigned remainder, REMU by 0 -> dividend
     uint32_t ua = (uint32_t)REGISTERS[rs1];
     uint32_t ub = (uint32_t)REGISTERS[rs2];
@@ -673,18 +606,16 @@ static inline int remu_op(void) {
 #pragma region U_Type_Emulation_Functions
 
 static inline int sign_extend_20(int imm20){
-    // return (imm20 >= 0x80000) ? (imm20 - 0x100000) : imm20;
-    // return (imm20 == 0x80000 || imm20 > 0x80000) ? (imm20 - 0x100000) : imm20;
-    return (imm20 + 1 > 0x80000) ? (imm20 - 0x100000) : imm20;
+    return (imm20 >= 0x80000) ? (imm20 - 0x100000) : imm20;
 }
 
 //2.4.1. Integer Register-Immediate Instructions
-static inline int lui_op(void) {
+static inline void lui_op(void) {
     int imm20 = sign_extend_20(imm);          // imm is global 20-bit field
     REGISTERS[rd] = leftShift(imm20, 12);     // imm[31:12] << 12
 }
 
-static inline int auipc_op(void) {
+static inline void auipc_op(void) {
     int imm20 = sign_extend_20(imm);
     REGISTERS[rd] = PC + leftShift(imm20, 12);
 }
@@ -698,11 +629,10 @@ static inline int auipc_op(void) {
 // 0x2_00000 = 2^21
 static inline int sign_extend_21(int off21)
 {
-    // return (off21 >= 0x100000) ? (off21 - 0x200000) : off21;
-    return (off21 + 1 > 0x100000) ? (off21 - 0x200000) : off21;
+    return (off21 >= 0x100000) ? (off21 - 0x200000) : off21;
 }
 
-static inline int jal_op(void) {
+static inline void jal_op(void) {
     REGISTERS[rd] = PC + 4; 
     PC += sign_extend_21(imm);
     skip_pc_increment = true; 
@@ -713,25 +643,25 @@ static inline int jal_op(void) {
 #pragma region S_Type_Emulation_Functions
 
 // 2.6. Load and Store Instructions
-static inline int sb_op(void) {      
+static inline void sb_op(void) {      
     /* Store Byte */
     int addr = REGISTERS[rs1] + sign_extend_12(imm);
     dMEM[addr] = getnbits(7, 0, REGISTERS[rs2]);
 }
 
-static inline int store_half(int addr, int value16) {
+static inline void store_half(int addr, int value16) {
     /* Store a 16-bit value into two bytes. */
     dMEM[addr]     = getnbits(7,  0, value16);
     dMEM[addr + 1] = getnbits(15, 8, value16);
 }
 
-static inline int sh_op(void) {      
+static inline void sh_op(void) {      
     /* Store Half-word */
     int addr = REGISTERS[rs1] + sign_extend_12(imm);
     store_half(addr, getnbits(15, 0, REGISTERS[rs2]));
 }
 
-static inline int store_word(int addr, int value32) {
+static inline void store_word(int addr, int value32) {
     /* Store a 32-bit value into four bytes. */
     dMEM[addr    ] = getnbits( 7,  0, value32);
     dMEM[addr + 1] = getnbits(15,  8, value32);
@@ -739,7 +669,7 @@ static inline int store_word(int addr, int value32) {
     dMEM[addr + 3] = getnbits(31, 24, value32);
 }
 
-static inline int sw_op(void) {
+static inline void sw_op(void) {
     /* Store Word */
     int addr = REGISTERS[rs1] + sign_extend_12(imm);
     store_word(addr, REGISTERS[rs2]);
@@ -752,57 +682,52 @@ static inline int sw_op(void) {
 // 0x1000 =  2^12 (bit 12 set)
 // 0x2000 =  2^13
 static inline int sign_extend_13(int off13) {
-    // return (off13 >= 0x1000) ? (off13 - 0x2000) : off13;
-    return (off13 + 1 > 0x1000) ? (off13 - 0x2000) : off13;
+    return (off13 >= 0x1000) ? (off13 - 0x2000) : off13;
 }
 
 // 2.5.2. Conditional Branches
 
-static inline int beq_op(void) {
+static inline void beq_op(void) {
     if (REGISTERS[rs1] == REGISTERS[rs2]) {
         PC += sign_extend_13(imm);
         skip_pc_increment = true;
     }
 }
 
-static inline int bne_op(void) {
+static inline void bne_op(void) {
     if (REGISTERS[rs1] != REGISTERS[rs2]) {
         PC += sign_extend_13(imm);
         skip_pc_increment = true;
     }
 }
 
-static inline int blt_op(void) {
+static inline void blt_op(void) {
     if (REGISTERS[rs1] < REGISTERS[rs2]) {
         PC += sign_extend_13(imm);
         skip_pc_increment = true;
     }
 }
 
-static inline int bge_op(void) {
-    if (REGISTERS[rs1] +1 > REGISTERS[rs2]) {
+static inline void bge_op(void) {
+    if (REGISTERS[rs1] >= REGISTERS[rs2]) {
         PC += sign_extend_13(imm);
         skip_pc_increment = true;
     }
 }
 
-static inline int bltu_op(void) {
+static inline void bltu_op(void) {
     unsigned int u1 = REGISTERS[rs1];
     unsigned int u2 = REGISTERS[rs2];
-
-    int diff = (int)(u1 - u2);
-    if (diff < 0) {
+    if (u1 < u2) {
         PC += sign_extend_13(imm);
         skip_pc_increment = true;
     }
 }
 
-static inline int bgeu_op(void) {
+static inline void bgeu_op(void) {
     unsigned int u1 = REGISTERS[rs1];
     unsigned int u2 = REGISTERS[rs2];
-
-    int diff = (int)(u1 - u2);
-    if (u1 == u2 || diff > 0) {
+    if (u1 >= u2) {
         PC += sign_extend_13(imm);
         skip_pc_increment = true;
     }
@@ -851,7 +776,7 @@ static inline int bgeu_op(void) {
 
 #pragma endregion
 
-int decode_R_type(void) {
+void decode_R_type(void) {
     // func7 (31 to 25) rs2(24 to 20) rs1(19 to 15) funct3(14 to 12) rd (11 to 7) opcode (6 to 0)
     funct7 = getnbits(31, 25, instruction);
     rs2    = getnbits(24, 20, instruction);
@@ -883,10 +808,10 @@ int decode_R_type(void) {
         else if (funct3 == F3_MULH  ) mulh_op();
         else if (funct3 == F3_MULHSU) mulhsu_op();
         else if (funct3 == F3_MULHU ) mulhu_op();
-        // else if (funct3 == F3_DIV   ) div_op();
-        // else if (funct3 == F3_DIVU  ) divu_op();
-        // else if (funct3 == F3_REM   ) rem_op();
-        // else if (funct3 == F3_REMU  ) remu_op();
+        else if (funct3 == F3_DIV   ) div_op();
+        else if (funct3 == F3_DIVU  ) divu_op();
+        else if (funct3 == F3_REM   ) rem_op();
+        else if (funct3 == F3_REMU  ) remu_op();
     }
         // Illegal R-type
     else {
@@ -894,7 +819,6 @@ int decode_R_type(void) {
         skip_pc_increment = true;
         PC = PROGRAM_LEN_LIMIT;
     }
-    return 0;
 }
 
 #pragma region I_Type_Instruction_Encodings
@@ -960,7 +884,7 @@ int decode_R_type(void) {
 
 #pragma endregion
 
-int decode_I_type(void){
+void decode_I_type(void){
     imm     = getnbits(31, 20, instruction);
     rs1     = getnbits(19, 15, instruction);
     funct3  = getnbits(14, 12, instruction);
@@ -968,8 +892,7 @@ int decode_I_type(void){
 
     if (opcode == OPCODE_I_ARITH) {
         // 2.4.1. Integer Register-Immediate Instructions
-        // if      (funct3 == FUNCT3_ADDI)  addi_op();
-        if      (funct3 == FUNCT3_ADDI)  add_op();
+        if      (funct3 == FUNCT3_ADDI)  addi_op();
         else if (funct3 == FUNCT3_XORI)  xori_op();
         else if (funct3 == FUNCT3_ORI)   ori_op();
         else if (funct3 == FUNCT3_ANDI)  andi_op();
@@ -978,8 +901,7 @@ int decode_I_type(void){
         else if (funct3 == FUNCT3_SLLI) {
             int f7 = getnbits(31, 25, instruction);
             if (f7 == FUNCT7_SLLI) slli_op();
-        } 
-        else if (funct3 == FUNCT3_SRLI_SRAI) {
+        } else if (funct3 == FUNCT3_SRLI_SRAI) {
             int f7 = getnbits(31, 25, instruction);
             if      (f7 == FUNCT7_SRLI) srli_op();
             else if (f7 == FUNCT7_SRAI) srai_op();
@@ -1007,8 +929,8 @@ int decode_I_type(void){
             else if (imm == IMM12_FENCE_TSO)   fence_tso_op();
             else if (imm == IMM12_PAUSE)       pause_op();
             else                               fence_op(fm, pred, succ); /* other hints */
-        }
-        else if (funct3 == FUNCT3_FENCE_I) {
+
+        } else if (funct3 == FUNCT3_FENCE_I) {
             // Chapter 5. "Zifencei" Extension for Instruction-Fetch Fence,
             fence_i_op();
         }
@@ -1032,10 +954,10 @@ int decode_I_type(void){
 
     }
     else {
-        // printf("ERROR: Unknown I-type instruction with opcode %d and funct3 %d\n", opcode, funct3);
+        printf("ERROR: Unknown I-type instruction with opcode %d and funct3 %d\n", opcode, funct3);
         skip_pc_increment = true;
         PC = PROGRAM_LEN_LIMIT;
-        return 0;
+        return;
     }
 }
 
@@ -1046,7 +968,7 @@ int decode_I_type(void){
 
 #pragma endregion
 
-int decode_U_type(void) {
+void decode_U_type(void) {
     // imm(31 to 12) rd(11 to 7) opcode (6 to 0)
     imm = getnbits(31, 12, instruction);
     rd = getnbits(11, 7, instruction);
@@ -1063,7 +985,7 @@ int decode_U_type(void) {
 #define OPCODE_JAL  0b1101111   /* 111 decimal */
 #pragma endregion
 
-int decode_J_type(void) {
+void decode_J_type(void) {
     /* imm[20|10:1|11|19:12]  + bit 0 = 0 (word-aligned)
     Compose 21-bit offset, then jal_op handles sign-ext */
     imm = leftShift(getnbits(31,31, instruction), 20)   // bit 20 (sign)
@@ -1087,7 +1009,7 @@ int decode_J_type(void) {
 
 #pragma endregion
 
-int decode_B_type(void) {
+void decode_B_type(void) {
     /* 13-bit offset layout: imm[12|10:5|4:1|11] and implicit bit-0 = 0. */
     imm = leftShift(getnbits(31,31,instruction), 12)   /* imm[12]   */
         + leftShift(getnbits(30,25,instruction),  5)   /* imm[10:5] */
@@ -1117,7 +1039,7 @@ int decode_B_type(void) {
 
 #pragma endregion
 
-int decode_S_type(void) {
+void decode_S_type(void) {
     /* imm = imm[11:5] | imm[4:0] */
     imm =  leftShift(getnbits(31,25,instruction), 5)   /* imm[11:5] */
         +            getnbits(11, 7,instruction);      /* imm[4:0]  */
@@ -1132,7 +1054,7 @@ int decode_S_type(void) {
     else if (funct3 == FUNCT3_SW) sw_op();
 }
 
-int init_decode() {
+void init_decode() {
     // Initialize global variables used in decode
     opcode = 0;
     imm = 0;
@@ -1142,7 +1064,6 @@ int init_decode() {
     funct7 = 0;
     rd = 0;
     skip_pc_increment = false;
-    return 0;
 }
 
 void debug_info_step(void) {
@@ -1157,39 +1078,31 @@ void debug_info_step(void) {
     printf("PC AFTER     %u\n\n", (unsigned)PC);
 }
 
-int decode(void) {
+void decode(void) {
     // Types: R, I, S, B, U, J
     opcode = getnbits(6, 0, instruction);
 
-    decode_R_type();
-    decode_I_type();
-    decode_S_type();
-    decode_U_type();
-    decode_J_type();
-    decode_B_type();
-
-    // if (opcode == OPCODE_R_TYPE) { 
-    //     decode_R_type();
-    // } else if (opcode == OPCODE_I_ARITH || opcode == OPCODE_I_LOAD || opcode == OPCODE_I_JALR || opcode == OPCODE_I_SYSTEM) {
-    //     decode_I_type();
-    // } else if (opcode == OPCODE_STORE){
-    //     decode_S_type();
-    // } else if (opcode == OPCODE_BRANCH) {          /* B-type */
-    //     decode_B_type();
-    // } else if (opcode == OPCODE_LUI || opcode == OPCODE_AUIPC) {   // U-type
-    //     decode_U_type();
-    // } else if (opcode == OPCODE_JAL) {         /* J-type */
-    //     decode_J_type();
-    // } else {
-    //     if (DEBUG) printf("Illegal opcode 0x%X at PC=%u\n", opcode, (unsigned)PC);
-    //     skip_pc_increment = true;
-    //     PC = PROGRAM_LEN_LIMIT;
-    // }
+    if (opcode == OPCODE_R_TYPE) { 
+        decode_R_type();
+    } else if (opcode == OPCODE_I_ARITH || opcode == OPCODE_I_LOAD || opcode == OPCODE_I_JALR || opcode == OPCODE_I_SYSTEM) {
+        decode_I_type();
+    } else if (opcode == OPCODE_STORE){
+        decode_S_type();
+    } else if (opcode == OPCODE_BRANCH) {          /* B-type */
+        decode_B_type();
+    } else if (opcode == OPCODE_LUI || opcode == OPCODE_AUIPC) {   // U-type
+        decode_U_type();
+    } else if (opcode == OPCODE_JAL) {         /* J-type */
+        decode_J_type();
+    } else {
+        if (DEBUG) printf("Illegal opcode 0x%X at PC=%u\n", opcode, (unsigned)PC);
+        skip_pc_increment = true;
+        PC = PROGRAM_LEN_LIMIT;
+    }
 
     REGISTERS[0] = 0;  // x0 is always zero
 
-    // if (DEBUG) debug_info_step();
-    return 0;
+    if (DEBUG) debug_info_step();
 }
 
 void debug_info_registers(void){
@@ -1201,7 +1114,7 @@ void debug_info_registers(void){
 #define ECALL_INST 0b1110011
 
 
-int main() {    
+int main() {
     int instructions[5] = {
       8586003,
       1213075,
@@ -1213,20 +1126,22 @@ int main() {
     PC = 0;
     int pc_word = 0;
     while(PC < PROGRAM_LEN_LIMIT) {
+        
         instruction = instructions[pc_word];
-        if (instruction == ECALL_INST) PC = PROGRAM_LEN_LIMIT;
+        if (instruction == ECALL_INST) break;   /* graceful halt */
+
         init_decode();  // reset global variables used in decode
         decode();
 
+
         if (!skip_pc_increment) {
             PC += 4;
-            ++pc_word;   /* next sequential word */
-        } 
-        else {
+            ++pc_word;                        /* next sequential word */
+        } else {
             pc_word = rightShift(PC, 2);      /* recompute after jump/branch */
         }
     }
 
-    // if (DEBUG) debug_info_registers();  // print final register state
+    if (DEBUG) debug_info_registers();  // print final register state
 
 }
